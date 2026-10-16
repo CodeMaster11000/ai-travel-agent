@@ -1,78 +1,58 @@
+### FILE: app/tools/attractions.py
+"""Attractions dataset querying and entrance fee verification with in-memory caching."""
+import functools
 import math
+import re
 from pathlib import Path
-
 import pandas as pd
+from app.config import ATTRACTIONS_FILE
 
-DATA_FILE = Path(__file__).resolve().parents[2] / "data" / "attractions.csv"
 FEE_COLUMN = "Entrance Fee in INR"
 NAME_COLUMN = "Name"
 CITY_COLUMN = "City"
 TYPE_COLUMN = "Type"
 
-
-def _load_dataset() -> pd.DataFrame:
-    if not DATA_FILE.is_file():
-        raise FileNotFoundError(
-            f"Attractions dataset not found at {DATA_FILE}. "
-            "Restore data/attractions.csv and try again."
-        )
+# FIX B2: In-memory cached loader to prevent reading attractions.csv on every query.
+@functools.lru_cache(maxsize=1)
+def load_dataset() -> pd.DataFrame:
+    if not ATTRACTIONS_FILE.is_file():
+        raise FileNotFoundError(f"Attractions dataset missing at {ATTRACTIONS_FILE}.")
     try:
-        frame = pd.read_csv(DATA_FILE)
-    except (OSError, pd.errors.ParserError, UnicodeDecodeError) as exc:
-        raise ValueError(f"Could not read the attractions dataset: {exc}") from exc
+        frame = pd.read_csv(ATTRACTIONS_FILE)
+    except Exception as exc:
+        raise ValueError(f"Could not load attractions dataset: {exc}") from exc
 
     frame.columns = frame.columns.astype(str).str.strip()
     required = {CITY_COLUMN, NAME_COLUMN, TYPE_COLUMN, FEE_COLUMN}
     missing = required.difference(frame.columns)
     if missing:
-        raise ValueError(
-            "Attractions dataset is missing required columns: "
-            + ", ".join(sorted(missing))
-        )
+        raise ValueError(f"Attractions CSV missing expected columns: {missing}")
     return frame
 
 
-def _clean_records(frame: pd.DataFrame) -> list[dict]:
-    # Convert NaN/NaT values to None so API responses remain JSON-safe.
-    cleaned = frame.astype(object).where(pd.notna(frame), None)
-    records = cleaned.to_dict(orient="records")
-    for record in records:
-        for key, value in record.items():
-            if hasattr(value, "item"):
-                record[key] = value.item()
-    return records
-
-
 def _location_matches(frame: pd.DataFrame, location: str) -> pd.Series:
-    """Match a destination against City, and State when the CSV provides it."""
     target = location.strip().casefold()
     city_matches = frame[CITY_COLUMN].astype(str).str.strip().str.casefold().eq(target)
     state_columns = [
-        column for column in frame.columns
-        if column.strip().casefold() in {"state", "state/union territory", "state or union territory"}
+        col for col in frame.columns
+        if col.strip().casefold() in {"state", "state/union territory", "state or union territory"}
     ]
     if not state_columns:
         return city_matches
     state_matches = pd.Series(False, index=frame.index)
-    for column in state_columns:
-        state_matches |= frame[column].astype(str).str.strip().str.casefold().eq(target)
+    for col in state_columns:
+        state_matches |= frame[col].astype(str).str.strip().str.casefold().eq(target)
     return city_matches | state_matches
 
 
-def search_attractions(
-    city: str,
-    category: str | None = None,
-    max_results: int = 10,
-) -> list[dict]:
-    """Search the local CSV by city or, if available, state and optional category."""
+def search_attractions(city: str, category: str | None = None, max_results: int = 10) -> list[dict]:
+    """Search for attractions in a city with optional category filtering."""
     if not isinstance(city, str) or not city.strip():
-        raise ValueError("A valid city name is required.")
-    if category is not None and not isinstance(category, str):
-        raise ValueError("Category must be text.")
-    if isinstance(max_results, bool) or not isinstance(max_results, int) or not 1 <= max_results <= 100:
-        raise ValueError("max_results must be an integer between 1 and 100.")
+        raise ValueError("A valid destination city name is required.")
+    if max_results < 1 or max_results > 100:
+        raise ValueError("max_results must be between 1 and 100.")
 
-    frame = _load_dataset()
+    frame = load_dataset()
     matches = frame[_location_matches(frame, city)].copy()
 
     if category and category.strip():
@@ -82,79 +62,77 @@ def search_attractions(
             )
         ]
 
-    return _clean_records(matches.head(max_results))
+    cleaned = matches.astype(object).where(pd.notna(matches), None)
+    records = cleaned.head(max_results).to_dict(orient="records")
+    for r in records:
+        for k, v in r.items():
+            if hasattr(v, "item"):
+                r[k] = v.item()
+    return records
 
 
-def calculate_attraction_fees(
-    city: str,
-    attraction_names: list[str],
-    people: int = 1,
-) -> dict:
-    """Sum entry fees for exact attraction names within a city/state destination."""
-    if not isinstance(city, str) or not city.strip():
-        raise ValueError("A valid city is required.")
-    if not isinstance(attraction_names, list) or not attraction_names:
-        raise ValueError("Provide at least one attraction name.")
-    if isinstance(people, bool) or not isinstance(people, int) or people < 1:
-        raise ValueError("People must be a positive integer.")
+# FIX B8: Resilient tokenized normalization to match attractions despite punctuation variance.
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
 
-    frame = _load_dataset()
+
+def calculate_attraction_fees(city: str, attraction_names: list[str], people: int = 1) -> dict:
+    """Calculate entry costs for a specified group across candidate attractions."""
+    if not attraction_names:
+        return {"city": city, "people": people, "attractions": [], "total_per_person": 0.0, "total_for_all_people": 0.0}
+
+    frame = load_dataset()
     city_rows = frame[_location_matches(frame, city)]
     if city_rows.empty:
-        return {"error": f"No attractions found for {city}."}
+        return {"error": f"No attractions found for destination: {city}"}
 
-    results, seen = [], set()
+    results = []
+    seen = set()
     total_per_person = 0.0
 
-    for requested_name in attraction_names:
-        if not isinstance(requested_name, str) or not requested_name.strip():
-            raise ValueError("Every attraction name must be a non-empty string.")
-        key = requested_name.strip().casefold()
-        if key in seen:
-            continue
-        seen.add(key)
+    normalized_map = {
+        _normalize_name(str(row[NAME_COLUMN])): row
+        for _, row in city_rows.iterrows()
+    }
 
-        match = city_rows[
-            city_rows[NAME_COLUMN].astype(str).str.strip().str.casefold() == key
-        ]
-        if match.empty:
+    for name in attraction_names:
+        norm = _normalize_name(name)
+        if norm in seen:
+            continue
+        seen.add(norm)
+
+        matched_row = normalized_map.get(norm)
+        if matched_row is None:
             results.append({
-                "name": requested_name.strip(),
-                "error": "Not found in the city's dataset; fee not included.",
+                "name": name,
+                "fee_per_person": 0.0,
+                "fee_for_all_people": 0.0,
+                "verified": False,
+                "error": "Attraction not present in dataset",
             })
             continue
 
-        row = match.iloc[0]
-        raw_fee = row[FEE_COLUMN]
+        raw_fee = matched_row[FEE_COLUMN]
         try:
             fee = float(raw_fee)
-        except (TypeError, ValueError):
-            fee = math.nan
+        except (ValueError, TypeError):
+            fee = 0.0
 
-        if not math.isfinite(fee) or fee < 0:
-            results.append({
-                "name": str(row[NAME_COLUMN]),
-                "error": "Entry fee is missing or invalid; fee not included.",
-            })
-            continue
+        is_valid_positive = math.isfinite(fee) and fee >= 0
+        fee_val = fee if is_valid_positive else 0.0
+        total_per_person += fee_val
 
-        total_per_person += fee
         results.append({
-            "name": str(row[NAME_COLUMN]),
-            "fee_per_person": round(fee, 2),
-            "fee_for_all_people": round(fee * people, 2),
+            "name": str(matched_row[NAME_COLUMN]),
+            "fee_per_person": round(fee_val, 2),
+            "fee_for_all_people": round(fee_val * people, 2),
+            "verified": (fee_val > 0),
         })
 
     return {
-        "city": city.strip(),
+        "city": city,
         "people": people,
         "attractions": results,
         "total_per_person": round(total_per_person, 2),
         "total_for_all_people": round(total_per_person * people, 2),
-        "note": "Fees come from the local CSV and may be outdated; verify before travel.",
     }
-
-
-if __name__ == "__main__":
-    import json
-    print(json.dumps(search_attractions("Jaipur", max_results=10), indent=2, ensure_ascii=False))
